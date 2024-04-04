@@ -1,0 +1,972 @@
+---
+title: "AIDC_dataAnalysis_lowEntropy"
+output: html_document
+date: "2024-03-18"
+---
+
+```{r setup, include=FALSE}
+#windows directory
+setwd("C:\\Users\\bbyers\\My Drive\\Research Papers\\Journal - AIDC for CCSC\\Analysis")
+
+
+```
+
+## Packages
+Load your packages here
+```{r Load Packages}
+library(ggplot2)
+library(RColorBrewer)
+library(dplyr)
+library(stringr)
+library(corrplot)
+library(tidyverse)
+library(lme4)
+library(car)
+library(wesanderson)
+library(knitr)
+library(gridExtra)
+library(patchwork)
+library(MASS)
+library(ggpubr)
+library(rstatix)
+library(dunn.test)
+library(bestNormalize)
+library(mvnormtest)
+library(clinfun)
+library(BSDA)
+library(vegan)
+library(permute)
+```
+
+
+## Data Cleaning
+Time was converted to seconds, and data was removed where the experiment conductor recommended throwing out the data.
+
+```{r data load and clean}
+data.raw <- read.csv("AIDC_anon_lowE_data.csv", header = TRUE)  
+
+
+#filter out data with bad readings
+data <- data.raw %>%
+  filter(!grepl("^throw out", Comments, ignore.case = TRUE))
+
+# Convert time to total seconds
+data$TimeSec <- with(data, {
+  time_parts <- strsplit(as.character(Time), ":")
+  minutes_to_seconds <- as.numeric(sapply(time_parts, `[`, 1)) * 60
+  seconds <- as.numeric(sapply(time_parts, `[`, 2))
+  minutes_to_seconds + seconds
+})
+
+#remove columns
+data <- data %>% select(-Comments, -Recorded, -Correct, -Time)
+
+#write.csv(data, "simple_data.csv", row.names = FALSE)
+```
+
+
+## Global Statistics
+Note these are calculated per device/system and not split per location as well, this would yield slightly different results. This process is done to normalize the data before statistical analysis.
+```{r grouped stats and outlier detection}
+
+#IMPORTANT: getting the stats just by device, not device and location
+
+grouped_stats <- data %>%
+  group_by(#Location, 
+           System
+           ) %>%
+  summarise(
+     n = n(),  # Count the number of non-NA observations in the group
+    Time_Mean = mean(TimeSec, na.rm = TRUE),
+    Time_SD = sd(TimeSec, na.rm = TRUE),
+    Time_Median = median(TimeSec, na.rm = TRUE),
+    Error_Mean = mean(Error, na.rm = TRUE),
+    Error_SD = sd(Error, na.rm = TRUE),
+    Error_Median = median(Error, na.rm = TRUE),
+    SUS_Mean = mean(SUS, na.rm = TRUE),
+    SUS_SD = sd(SUS, na.rm = TRUE),
+    SUS_Median = median(SUS, na.rm = TRUE),
+    .groups = 'drop'  # This will prevent the grouping to affect subsequent operations
+  )
+grouped_stats
+
+```
+
+
+```{r modified figs}
+# Adjusting plots with increased label sizes
+p1 <- ggplot(data, aes(x = Location, y = TimeSec, fill = Location)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "red") +
+  labs(#title = "Boxplot of Time by Location", 
+       y = "Time (seconds)", x = "Location") +
+  scale_fill_manual(values = wes_palette("AsteroidCity3")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        #plot.title = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14))
+
+p3 <- ggplot(data, aes(x = Location, y = SUS, fill = Location)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "red") +
+  labs(#title = "Boxplot of SUS by Location", 
+       y = "SUS", x = "Location") +
+  scale_fill_manual(values = wes_palette("AsteroidCity3")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        #plot.title = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14))
+
+p5 <- ggplot(data, aes(x = Location, y = Error, fill = Location)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "red") +
+  labs(#title = "Boxplot of Errors by Location", 
+       y = "Errors", x = "Location") +
+  scale_fill_manual(values = wes_palette("AsteroidCity3")) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        #plot.title = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14))
+
+# Combine the plots
+grid_plot <- grid.arrange(p1, p3, p5, ncol = 3, nrow = 1)
+
+# Export to PNG
+ggsave("EDA_Location.png", grid_plot, width = 16, height = 12)
+
+```
+
+
+
+```{r detecting and removing outliers}
+# Add a row identifier to the original data
+data <- data %>% mutate(row_id = row_number())
+
+# Merge with grouped_stats to get the mean and SD
+data.stats <- data %>% left_join(grouped_stats, by = c(#"Location", 
+                                                       "System"))
+
+# Identify outliers
+outliers_TimeSec <- data.stats %>% filter(abs(TimeSec - Time_Mean) > 3 * Time_SD) #%>% select(row_id)
+outliers_Error <- data.stats %>% filter(abs(Error - Error_Mean) > 3 * Error_SD) #%>% select(row_id)
+outliers_SUS <- data.stats %>% filter(abs(SUS - SUS_Mean) > 3 * SUS_SD) #%>% select(row_id)
+
+# Combine all outlier identifiers
+all_outliers <- bind_rows(outliers_TimeSec, outliers_Error, outliers_SUS) %>% distinct()
+
+# Remove the identified outliers from the original data
+clean_data <- data.stats %>% 
+  filter(!(row_id %in% all_outliers$row_id)) %>%
+  select(-row_id, -starts_with("Time_"), -starts_with("Error_"), -starts_with("SUS_"))
+
+```
+Some outliers were found
+
+
+```{r}
+data <- clean_data
+count(all_outliers)
+```
+Data cleaned by removing outliers greater than 3 standard deviations away from the mean.
+
+```{r summary stats after outliers removed}
+grouped_stats <- data %>%
+  group_by(#Location, 
+           System
+           ) %>%
+  summarise(
+    n = n(),  # Count the number of non-NA observations in the group
+    Time_Mean = mean(TimeSec, na.rm = TRUE),
+    Time_SD = sd(TimeSec, na.rm = TRUE),
+    Time_Median = median(TimeSec, na.rm = TRUE),
+    Error_Mean = mean(Error, na.rm = TRUE),
+    Error_SD = sd(Error, na.rm = TRUE),
+    Error_Median = median(Error, na.rm = TRUE),
+    SUS_Mean = mean(SUS, na.rm = TRUE),
+    SUS_SD = sd(SUS, na.rm = TRUE),
+    SUS_Median = median(SUS, na.rm = TRUE),
+    .groups = 'drop'  # This will prevent the grouping to affect subsequent operations
+  )
+grouped_stats
+```
+
+
+
+## Exploring Data
+```{r Exploratory}
+
+# Assuming 'data' is your data frame and the plots have been defined as follows:
+p1 <- ggplot(data, aes(x = Location, y = TimeSec, fill = Location)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "red") +
+  labs(title = "Boxplot of Time by Location", y = "Time (seconds)", x = "Location") +
+  scale_fill_manual(values = wes_palette("AsteroidCity3")) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+p2 <- ggplot(data, aes(x = System, y = TimeSec, fill = System)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "red") +
+  labs(title = "Boxplot of Time by System", y = "Time (seconds)", x = "System") +
+  scale_fill_manual(values = wes_palette("AsteroidCity3")) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+p3 <- ggplot(data, aes(x = Location, y = SUS, fill = Location)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "red") +
+  labs(title = "Boxplot of SUS by Location", y = "SUS", x = "Location") +
+  scale_fill_manual(values = wes_palette("AsteroidCity3")) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+p4 <- ggplot(data, aes(x = System, y = SUS, fill = System)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.2, fill = NA, outlier.shape = NA) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "red") +
+  labs(title = "Boxplot of SUS by System", y = "SUS", x = "System") +
+  scale_fill_manual(values = wes_palette("AsteroidCity3")) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# Combine the plots
+grid_plot <- grid.arrange(p1, p2, p3, p4, ncol = 2, nrow = 2)
+
+# Export to PNG
+ggsave("EDA_SUS_Time.png", grid_plot, width = 16, height = 12)
+```
+
+
+## Data spread by location and device
+```{r Faceted Boxplots for all variables}
+# Replace 'Time' with 'Error' and 'SUS' for the other dependent variables
+
+# Faceting by 'System'
+p1 <- ggplot(data, aes(x = Location, y = TimeSec, fill = Location)) + 
+  geom_boxplot(outlier.shape = NA) + # Hide outliers for cleaner plots
+  geom_point(data = data, aes(y = TimeSec), position = position_jitter(width = 0.2), alpha = 0.5) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "red") +
+  facet_wrap(~System, scales = "free_x") +
+  scale_fill_brewer(palette = "Blues") +
+  theme_minimal() +
+  theme(legend.position = "none", panel.background = element_blank()) +
+  labs(#title = "Boxplot of Time by Location and System", 
+       y = "Time", x = "Location")
+
+# Faceting by 'System'
+p2 <- ggplot(data, aes(x = Location, y = SUS, fill = Location)) + 
+  geom_boxplot(outlier.shape = NA) + # Hide outliers for cleaner plots
+  geom_point(data = data, aes(y = SUS), position = position_jitter(width = 0.2), alpha = 0.5) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "red") +
+  facet_wrap(~System, scales = "free_x") +
+  #scale_fill_manual(values = wes_palette("AsteroidCity3")) +
+  scale_fill_brewer(palette = "Blues") +
+  theme_minimal() +
+  theme(legend.position = "none") + # Remove the legend
+  labs(#title = "Boxplot of SUS by Location and System", 
+       y = "SUS", x = "Location")
+
+# Faceting by 'System'
+p3 <- ggplot(data, aes(x = Location, y = Error, fill = Location)) + 
+  geom_boxplot(outlier.shape = NA) + # Hide outliers for cleaner plots
+  geom_point(data = data, aes(y = Error), position = position_jitter(width = 0.2), alpha = 0.5) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3, color = "red") +
+  facet_wrap(~System, scales = "free_x") +
+  scale_fill_brewer(palette = "Blues") +
+  theme_minimal() +
+  theme(legend.position = "none") + # Remove the legend
+  labs(#title = "Boxplot of Errors by Location and System", 
+       y = "Errors", x = "Location")
+
+# To print the plots
+print(p1)
+print(p2)
+print(p3)
+```
+
+
+
+```{r modified figsss}
+# Combine the plots into a single figure
+combined_plot <- p1 / p2 / p3
+
+# Use patchwork to align the plots
+combined_plot <- combined_plot + 
+                 plot_layout(guides = 'collect') + # Collect guides and align
+                 plot_annotation(tag_levels = 'A') # Add tags if necessary
+
+# Now, save the combined plot to a PNG file
+ggsave("combined_scatter_plots.png", combined_plot, width = 16, height = 18)
+
+```
+
+
+
+## Correlations?
+```{r Correlations...?}
+# Assuming data$Time, data$Error, and data$SUS are numeric
+correlation_matrix <- cor(data[,c("TimeSec", "Error", "SUS")], use = "complete.obs")
+
+blue_palette <- colorRampPalette(c("lightblue", "blue"))(200)
+
+# Open a PNG graphics device
+png("correlation_plot.png", width = 800, height = 600)
+
+# Create the correlation plot using the blue color palette
+corrplot(correlation_matrix, method = "circle", 
+         #addCoef.col = "black", col = blue_palette, 
+         #number.cex = 1.5,  # Larger text size for the coefficients
+         cl.pos = "r",  # Position the color legend on the right
+         tl.col = "black", tl.srt = 45, # Rotate top labels to 45 degrees
+         tl.cex = 1.5,  # Larger text size for the labels
+         tl.pos = "t")  # Ensure top labels are used
+
+# Close the device
+dev.off()
+```
+
+
+
+# Pre-checks of data for ANOVA Statistical Analysis
+
+## Normality Testing
+
+```{r NEED TO CHECK DATA BEFORE ANOVA}
+# Remember to check the assumptions of ANOVA, such as normality of the residuals and homogeneity of variances, before relying on the results. If the assumptions are violated, a non-parametric alternative like the Kruskal-Wallis test might be more appropriate.
+
+# Normality check (using Shapiro-Wilk test):
+
+shapiro.test(data$SUS)
+shapiro.test(data$TimeSec)
+shapiro.test(data$Error)
+
+hist(data$SUS)
+hist(data$TimeSec)
+hist(data$Error)
+
+```
+Results do not look so normal....
+
+### Log Transform
+
+```{r transformations for ANOVA checks}
+shapiro.test(data$SUS)
+shapiro.test(data$TimeSec)
+shapiro.test(data$Error)
+
+# Logarithmic transformation (add a small constant if data contains zeros)
+constant_to_add <- 1e-6  # This is an arbitrarily small number to offset zero values
+data$SUS_log <- log(data$SUS + constant_to_add)
+data$TimeSec_log <- log(data$TimeSec + constant_to_add)
+data$Error_log <- log(data$Error + constant_to_add)
+
+# Shapiro-Wilk normality test on log-transformed data
+shapiro.test(data$SUS_log)
+shapiro.test(data$TimeSec_log)
+shapiro.test(data$Error_log)
+
+```
+noooot great, only log transformation of time works out
+
+### Yeo-Johnson transform Test
+```{r}
+# Apply the Yeo-Johnson transformation
+transformed_data <- bestNormalize(data$SUS, method = "yeojohnson")
+
+# The transformed data
+transformed_values = transformed_data$x.t
+
+# If you need to use the transformed data, you can now work with 'transformed_values'
+# or directly with 'transformed_data$x.t'
+
+shapiro.test(transformed_values)
+```
+
+### Box-Cox Transform Test
+```{r box-cox}
+# Assuming 'data' is your data frame and 'Error' is the column to be normalized
+
+# Add the constant to the Error data to ensure all values are positive
+constant <- abs(min(data$Error, na.rm = TRUE)) + 1
+data$Error_positive <- data$Error + constant
+
+# Ensure that the data is numeric and handle NA or infinite values
+data$Error_positive <- as.numeric(data$Error_positive)
+data$Error_positive <- na.omit(data$Error_positive)
+data$Error_positive <- data$Error_positive[is.finite(data$Error_positive)]
+
+# Check that data$Error_positive is not empty
+if(length(data$Error_positive) == 0) {
+  stop("Error_positive is empty after processing.")
+}
+
+# Box-Cox transformation using the bestNormalize package
+library(bestNormalize)
+bc_Error <- boxcox(data$Error_positive)
+
+# Ensure that the Box-Cox transformation was successful and 'bc_Error' contains the lambda
+if(is.null(bc_Error$lambda) || length(bc_Error$lambda) == 0) {
+  stop("boxcox transformation did not return a valid lambda value.")
+}
+
+# Extract the lambda value
+lambda_Error <- bc_Error$lambda
+
+# Perform the Box-Cox transformation using the optimal lambda
+data$Error_bc <- if(lambda_Error == 0) {
+  log(data$Error_positive)
+} else {
+  (data$Error_positive^lambda_Error - 1) / lambda_Error
+}
+
+# Conduct the Shapiro-Wilk test to check for normality
+shapiro_test_result <- shapiro.test(data$Error_bc)
+
+# Output the Shapiro-Wilk test result
+print(shapiro_test_result)
+
+```
+
+
+## Homoscedasticity Testing
+
+```{r Homoscedasticity Testing}
+# Assuming 'model' is your ANOVA model
+model.SUS <- aov(SUS ~ Location + System, data = data)
+model.Error <- aov(Error ~ Location + System, data = data)
+model.TimeSec <- aov(TimeSec ~ Location + System, data = data)
+
+# Generate diagnostic plots
+par(mfrow = c(2, 2))  # Set up the plotting area to show 4 plots
+plot(model.SUS, main = "SUS - Homoscedasticity Plots")  # Generates four diagnostic plots, including Residuals vs. Fitted
+plot(model.Error, main = "Error - Homoscedasticity Plots")
+plot(model.TimeSec, main = "Time - Homoscedasticity Plots")
+par(mfrow = c(1, 1))  # Reset to default plotting settings
+
+```
+
+Summary: Data does not pass checks like normality and ANOVA testing shouldn't be used. 
+
+
+
+
+
+# Alternative Analyses when not passing ANOVA assumptions
+
+
+
+## use non-parametric Kruskal-Wallis
+Does not assume a normal distribution of data or equal variances across groups
+
+```{r Kruskal-Wallis}
+# For 'Error' as DV
+kw_error_location <- kruskal.test(Error ~ Location, data = data)
+kw_error_system <- kruskal.test(Error ~ System, data = data)
+
+# For 'TimeSec' as DV
+kw_timesec_location <- kruskal.test(TimeSec ~ Location, data = data)
+kw_timesec_system <- kruskal.test(TimeSec ~ System, data = data)
+
+# For 'SUS' as DV
+kw_sus_location <- kruskal.test(SUS ~ Location, data = data)
+kw_sus_system <- kruskal.test(SUS ~ System, data = data)
+
+# Print the results
+list(
+  Error_Location = kw_error_location,
+  Error_System = kw_error_system,
+  TimeSec_Location = kw_timesec_location,
+  TimeSec_System = kw_timesec_system,
+  SUS_Location = kw_sus_location,
+  SUS_System = kw_sus_system
+)
+```
+No significant difference in Error across different Locations and Systems.
+TimeSec and SUS scores are significantly affected by the System, but not by the Location.
+
+
+
+```{r Post-hoc Dunn Test}
+# Post hoc test for 'TimeSec' by 'System'
+dunn_test_result_TimeSec <- dunn.test(data$TimeSec, data$System, method="bonferroni")
+
+# Post hoc test for 'SUS' by 'System'
+dunn_test_result_SUS <- dunn.test(data$SUS, data$System, method="bonferroni")
+
+# Print the results
+print(dunn_test_result_TimeSec)
+print(dunn_test_result_SUS)
+```
+There are significant differences between the groups DPM and NFC, and DPM and QR in both analyses, as evidenced by the very low p-values. The comparisons between NFC and QR are not statistically significant in both analyses, with p-values above the 0.05 threshold.
+
+
+## Adonis PermANOVA/PerMANOVA:
+
+As this requires the least amount of data-modification, this PermANOVA was reported in the paper. As the error data contains negative values, +10 was added to each value to avoid errors in the calculation.
+
+### One-way PermANOVA:
+```{r Adonis Perm one_way_ANOVA}
+
+a_permutation_anova_timeo <- adonis(data$TimeSec ~ Location + System, data = data, permutations = 999)
+
+data_error <- data %>%
+    mutate(Error = Error + 10.00000)
+a_permutation_anova_erroro <- adonis(data_error$Error ~ Location + System, data = data_error, permutations = 999)
+
+a_permutation_anova_suso <- adonis(data$SUS ~ Location + System, data = data, permutations = 999)
+
+# Print the results
+print("Permutation ANOVA for TimeSec:")
+print(a_permutation_anova_timeo)
+
+print("Permutation ANOVA for Error:")
+print(a_permutation_anova_erroro)
+
+print("Permutation ANOVA for SUS:")
+print(a_permutation_anova_suso)
+```
+
+Note the message was provided on "'adonis' will be deprecated: use 'adonis2' instead" adonis2 analysis is provided in the appendix as additional data transforms were needed to use the new package.
+
+
+### Two-way PermANOVA:
+```{r Adonis Perm two_way_ANOVA}
+
+a_permutation_anova_timet <- adonis(data$TimeSec ~ Location * System, data = data, permutations = 999)
+
+data_error <- data %>%
+    mutate(Error = Error + 10.00000)
+a_permutation_anova_errort <- adonis(data_error$Error ~ Location * System, data = data_error, permutations = 999)
+
+a_permutation_anova_sust <- adonis(data$SUS ~ Location * System, data = data, permutations = 999)
+
+# Print the results
+print("Permutation ANOVA for TimeSec:")
+print(a_permutation_anova_timet)
+
+print("Permutation ANOVA for Error:")
+print(a_permutation_anova_errort)
+
+print("Permutation ANOVA for SUS:")
+print(a_permutation_anova_sust)
+```
+
+
+
+### PermANOVA AIC test for model fit
+```{r Adonis PermANOVA AIC}
+# Extract Values manually from Results of ANOVA decimal normalisation
+a_RSSoT <- 2.2132 
+a_RSSoE <- 0.48889
+a_RSSoS <- 1.45511
+a_RSStT <- 2.0123 
+a_RSStE <- 0.45558
+a_RSStS <- 1.35309
+k <- 4
+n <- 118
+
+# AIC one way dec
+a_LoT <- (1 / sqrt(2 * pi))^n * exp(-a_RSSoT / 2)
+a_LoE <- (1 / sqrt(2 * pi))^n * exp(-a_RSSoE / 2)
+a_LoS <- (1 / sqrt(2 * pi))^n * exp(-a_RSSoS / 2)
+
+a_AIC_value_oT <- 2 * k - 2 * log(a_LoT)
+a_AIC_value_oE <- 2 * k - 2 * log(a_LoE)
+a_AIC_value_oS <- 2 * k - 2 * log(a_LoS)
+
+# AIC two way dec
+a_LtT <- (1 / sqrt(2 * pi))^n * exp(-a_RSStT / 2)
+a_LtE <- (1 / sqrt(2 * pi))^n * exp(-a_RSStE / 2)
+a_LtS <- (1 / sqrt(2 * pi))^n * exp(-a_RSStS / 2)
+
+a_AIC_value_tT <- 2 * k - 2 * log(a_LtT)
+a_AIC_value_tE <- 2 * k - 2 * log(a_LtE)
+a_AIC_value_tS <- 2 * k - 2 * log(a_LtS)
+
+# print the Results
+print(a_AIC_value_oT)
+print(a_AIC_value_tT)
+print(a_AIC_value_oE)
+print(a_AIC_value_tE)
+print(a_AIC_value_oS)
+print(a_AIC_value_tS)
+```
+As we can see, the AIC-Criterion doesn't point to a better model. In summary the permutational ANOVA/PERMANOVA support the findings from the previous analysis.
+
+### PerMANOVA:
+```{r Adonis PerMANOVA}
+# errors not equal to 0
+data_error <- data %>%
+  mutate(Error = Error + 10.0000000000)
+
+# Manova Test
+a_manova_result <- manova(cbind(TimeSec, Error, SUS) ~ Location * System, data = data_error)
+
+
+# adonis for permutation testing
+a_perm_test <- adonis(data_error[, c("TimeSec", "Error", "SUS")] ~ Location * System, data = data_error, permutations = 999)
+
+# Display results
+print(a_perm_test)
+
+```
+
+
+## Hypothesis Testing
+
+### Test for H1) As the level of device digitization increases, reading time will decrease
+```{r H1 JT test}
+#data$Site <- factor(data$Location, levels = c("Lower", "Upper", "Garage"), ordered = FALSE)
+data$Digitization <- factor(data$System, levels = c("DPM", "QR", "NFC"), ordered = TRUE)
+
+# Conduct the Jonckheere-Terpstra test
+print(jonckheere.test(data$TimeSec, data$Digitization))
+
+```
+
+```{r H1 Spearman}
+# Spearman's correlation test
+# Check for sufficient variability
+if (length(unique(data$TimeSec)) > 1 && length(unique(data$Digitization)) > 1) {
+    # Perform Spearman's rank correlation test
+    spearman_result <- cor.test(data$TimeSec, as.numeric(data$Digitization), method = "spearman")
+    print(spearman_result)
+} else {
+    cat("Not enough variability in data for Spearman's correlation test.\n")
+}
+```
+### test H2) higher levels of device digitization are anticipated to result in a decrease in the number of errors
+```{r H2 JT and Spearman test}
+# Conduct the Jonckheere-Terpstra test
+print(jonckheere.test(data$Error, data$Digitization))
+
+# Spearman's correlation test
+# Check for sufficient variability
+if (length(unique(data$Error)) > 1 && length(unique(data$Digitization)) > 1) {
+    # Perform Spearman's rank correlation test
+    spearman_result <- cor.test(data$Error, as.numeric(data$Digitization), method = "spearman")
+    print(spearman_result)
+} else {
+    cat("Not enough variability in data for Spearman's correlation test.\n")
+}
+```
+
+
+### test for H3) higher levels of device digitization are anticipated to result in greater SUS scores
+```{r H3 JT and Spearman}
+# Conduct the Jonckheere-Terpstra test
+print(jonckheere.test(data$SUS, data$Digitization))
+
+# Spearman's correlation test
+# Check for sufficient variability
+if (length(unique(data$SUS)) > 1 && length(unique(data$Digitization)) > 1) {
+    # Perform Spearman's rank correlation test
+    spearman_result <- cor.test(data$SUS, as.numeric(data$Digitization), method = "spearman")
+    print(spearman_result)
+} else {
+    cat("Not enough variability in data for Spearman's correlation test.\n")
+}
+```
+
+# Conclusions 
+- the selection of the tracking device has impact on speed and user experience 
+- the differences between NFC and QR Codes are small on their impact on speed and experience, but both had significant impact
+- NFC had slightly faster times and slightly higher user experience than QR Code
+- DPM is slowest and worst user experience
+- Number of errors was not impacted by choice of system or location
+- the experiment was run in parallel in different locations, it was shown that location has slight impact on results
+- Negative correlation between time and SUS
+
+
+
+
+#Appendix:
+
+## Adonis2 PermANOVA/PerMANOVA not reported in paper due to data transformations:
+For Adonis2, the data for each of the dependent variables was transformed into a distance-matrix (method=eucledian).  As the residual sum of squares got to big for calculating the AIC, the data was normalized using on one hand scaling by the factor 100 and z-transformation. 
+```{r Adonis2 Perm one_way_ANOVA z-factor normalisation}
+# Extract the variables to be normalized
+time_sec <- data$TimeSec
+error <- data$Error
+sus <- data$SUS
+
+# Z-score normalization for each variable
+normalized_time_sec <- (time_sec - mean(time_sec)) / sd(time_sec)
+normalized_error <- (error - mean(error)) / sd(error)
+normalized_sus <- (sus - mean(sus)) / sd(sus)
+
+# Create a new dataset with normalized variables
+data_normalized <- data
+data_normalized$TimeSec <- normalized_time_sec
+data_normalized$Error <- normalized_error
+data_normalized$SUS <- normalized_sus
+
+# Conduct permutation ANOVA for each dependent variable
+
+data_matrixT <- data_normalized[, c("TimeSec")]
+datadistT <- vegdist(data_matrixT, method = "euclidean")
+a2z_permutation_anova_time <- adonis2(datadistT ~ Location + System, data = data_normalized, permutations = 999)
+
+data_matrixE <- data_normalized[, c("Error")]
+datadistE <- vegdist(data_matrixE, method = "euclidean")
+a2z_permutation_anova_error <- adonis2(datadistE ~ Location + System, data = data_normalized, permutations = 999)
+
+data_matrixS <- data_normalized[, c("SUS")]
+datadistS <- vegdist(data_matrixS, method = "euclidean")
+a2z_permutation_anova_sus <- adonis2(datadistS ~ Location + System, data = data_normalized, permutations = 999)
+
+# Print the results
+print("Permutation ANOVA for TimeSec:")
+print(a2z_permutation_anova_time)
+
+print("Permutation ANOVA for Error:")
+print(a2z_permutation_anova_error)
+
+print("Permutation ANOVA for SUS:")
+print(a2z_permutation_anova_sus)
+```
+
+
+```{r Adonis2 Perm two_way_ANOVA z-factor normalisation}
+# Extract the variables to be normalized
+time_sec <- data$TimeSec
+error <- data$Error
+sus <- data$SUS
+
+# Z-score normalization for each variable
+normalized_time_sec <- (time_sec - mean(time_sec)) / sd(time_sec)
+normalized_error <- (error - mean(error)) / sd(error)
+normalized_sus <- (sus - mean(sus)) / sd(sus)
+
+# Create a new dataset with normalized variables
+data_normalized <- data
+data_normalized$TimeSec <- normalized_time_sec
+data_normalized$Error <- normalized_error
+data_normalized$SUS <- normalized_sus
+
+# Conduct permutation ANOVA for each dependent variable
+
+data_matrixT <- data_normalized[, c("TimeSec")]
+datadistT <- vegdist(data_matrixT, method = "manhattan")
+a2z_two_permutation_anova_time <- adonis2(datadistT ~ Location * System, data = data_normalized, permutations = 999)
+
+data_matrixE <- data_normalized[, c("Error")]
+datadistE <- vegdist(data_matrixE, method = "euclidean")
+a2z_two_permutation_anova_error <- adonis2(datadistE ~ Location * System, data = data_error, permutations = 999)
+
+data_matrixS <- data_normalized[, c("SUS")]
+datadistS <- vegdist(data_matrixS, method = "euclidean")
+a2z_two_permutation_anova_sus <- adonis2(datadistS ~ Location * System, data = data_normalized, permutations = 999)
+
+# Print the results
+print("Permutation ANOVA for TimeSec:")
+print(a2z_two_permutation_anova_time)
+
+print("Permutation ANOVA for Error:")
+print(a2z_two_permutation_anova_error)
+
+print("Permutation ANOVA for SUS:")
+print(a2z_two_permutation_anova_sus)
+```
+
+
+```{r Adonis2 zfactor AIC}
+# Extract Values manually from Results of ANOVA decimal normalisation
+a2z_RSSoT <- 39.161 
+a2z_RSSoE <- 108.864
+a2z_RSSoS <- 52.461
+a2z_RSStT <- 37.853 
+a2z_RSStE <- 99.202
+a2z_RSStS <- 49.359
+k <- 4
+n <- 118
+
+# AIC one way dec
+a2z_LoT <- (1 / sqrt(2 * pi))^n * exp(-a2z_RSSoT / 2)
+a2z_LoE <- (1 / sqrt(2 * pi))^n * exp(-a2z_RSSoE / 2)
+a2z_LoS <- (1 / sqrt(2 * pi))^n * exp(-a2z_RSSoS / 2)
+
+a2z_AIC_value_oT <- 2 * k - 2 * log(a2z_LoT)
+a2z_AIC_value_oE <- 2 * k - 2 * log(a2z_LoE)
+a2z_AIC_value_oS <- 2 * k - 2 * log(a2z_LoS)
+
+# AIC two way dec
+a2z_LtT <- (1 / sqrt(2 * pi))^n * exp(-a2z_RSStT / 2)
+a2z_LtE <- (1 / sqrt(2 * pi))^n * exp(-a2z_RSStE / 2)
+a2z_LtS <- (1 / sqrt(2 * pi))^n * exp(-a2z_RSStS / 2)
+
+a2z_AIC_value_tT <- 2 * k - 2 * log(a2z_LtT)
+a2z_AIC_value_tE <- 2 * k - 2 * log(a2z_LtE)
+a2z_AIC_value_tS <- 2 * k - 2 * log(a2z_LtS)
+
+# print the Results
+print(a2z_AIC_value_oT)
+print(a2z_AIC_value_tT)
+print(a2z_AIC_value_oE)
+print(a2z_AIC_value_tE)
+print(a2z_AIC_value_oS)
+print(a2z_AIC_value_tS)
+```
+
+
+```{r Adonis2 Perm one_way_ANOVA decimal normalisation}
+# Extract the variables to be normalized
+time_sec <- data$TimeSec
+error <- data$Error
+sus <- data$SUS
+
+# Choose the scaling factor
+scaling_factor <- 100
+
+# Decimal scaling for each variable
+scaled_time_sec <- time_sec / scaling_factor
+scaled_error <- error / scaling_factor
+scaled_sus <- sus / scaling_factor
+
+# Create a new dataset with scaled variables
+data_scaled <- data
+data_scaled$TimeSec <- scaled_time_sec
+data_scaled$Error <- scaled_error
+data_scaled$SUS <- scaled_sus
+
+# Conduct permutation ANOVA for each dependent variable
+
+data_matrixT <- data_scaled[, c("TimeSec")]
+datadistT <- vegdist(data_matrixT, method = "manhattan")
+a2dec_permutation_anova_time <- adonis2(datadistT ~ Location + System, data = data_scaled, permutations = 999)
+
+data_matrixE <- data_normalized[, c("Error")]
+datadistE <- vegdist(data_matrixE, method = "euclidean")
+a2dec_permutation_anova_error <- adonis2(datadistE ~ Location + System, data = data_normalized, permutations = 999)
+
+data_matrixS <- data_scaled[, c("SUS")]
+datadistS <- vegdist(data_matrixS, method = "euclidean")
+a2dec_permutation_anova_sus <- adonis2(datadistS ~ Location + System, data = data_scaled, permutations = 999)
+
+# Print the results
+print("Permutation ANOVA for TimeSec:")
+print(a2dec_permutation_anova_time)
+
+
+print("Permutation ANOVA for Error:")
+print(a2dec_permutation_anova_error)
+
+print("Permutation ANOVA for SUS:")
+print(a2dec_permutation_anova_sus)
+```
+
+
+```{r Adonis2 Perm two_way_ANOVA decimal normalisation}
+# Extract the variables to be normalized
+time_sec <- data$TimeSec
+error <- data$Error
+sus <- data$SUS
+
+# Choose the scaling factor
+scaling_factor <- 100
+
+# Decimal scaling for each variable
+scaled_time_sec <- time_sec / scaling_factor
+scaled_error <- error / scaling_factor
+scaled_sus <- sus / scaling_factor
+
+# Create a new dataset with scaled variables
+data_scaled <- data
+data_scaled$TimeSec <- scaled_time_sec
+data_scaled$Error <- scaled_error
+data_scaled$SUS <- scaled_sus
+
+# Conduct permutation ANOVA for each dependent variable
+
+data_matrixT <- data_scaled[, c("TimeSec")]
+datadistT <- vegdist(data_matrixT, method = "manhattan")
+a2dec_two_permutation_anova_time <- adonis2(datadistT ~ Location * System, data = data_scaled, permutations = 999)
+
+data_matrixE <- data_normalized[, c("Error")]
+datadistE <- vegdist(data_matrixE, method = "euclidean")
+a2dec_two_permutation_anova_error <- adonis2(datadistE ~ Location * System, data = data_error, permutations = 999)
+
+data_matrixS <- data_scaled[, c("SUS")]
+datadistS <- vegdist(data_matrixS, method = "euclidean")
+a2dec_two_permutation_anova_sus <- adonis2(datadistS ~ Location * System, data = data_scaled, permutations = 999)
+
+# Print the results
+print("Permutation ANOVA for TimeSec:")
+print(a2dec_two_permutation_anova_time)
+
+print("Permutation ANOVA for Error:")
+print(a2dec_two_permutation_anova_error)
+
+print("Permutation ANOVA for SUS:")
+print(a2dec_two_permutation_anova_sus)
+
+```
+
+
+```{r Adonis2 decimal AIC}
+# Extract Values manually from Results of ANOVA decimal normalisation
+a2dec_RSSoT <- 69.824 
+a2dec_RSSoE <- 108.864
+a2dec_RSSoS <- 1.9764
+a2dec_RSStT <- 67.491 
+a2dec_RSStE <- 99.202
+a2dec_RSStS <- 1.8595
+k <- 4
+n <- 118
+
+# AIC one way dec
+a2dec_LoT <- (1 / sqrt(2 * pi))^n * exp(-a2dec_RSSoT / 2)
+a2dec_LoE <- (1 / sqrt(2 * pi))^n * exp(-a2dec_RSSoE / 2)
+a2dec_LoS <- (1 / sqrt(2 * pi))^n * exp(-a2dec_RSSoS / 2)
+
+a2dec_AIC_value_oT <- 2 * k - 2 * log(a2dec_LoT)
+a2dec_AIC_value_oE <- 2 * k - 2 * log(a2dec_LoE)
+a2dec_AIC_value_oS <- 2 * k - 2 * log(a2dec_LoS)
+
+# AIC two way dec
+a2dec_LtT <- (1 / sqrt(2 * pi))^n * exp(-a2dec_RSStT / 2)
+a2dec_LtE <- (1 / sqrt(2 * pi))^n * exp(-a2dec_RSStE / 2)
+a2dec_LtS <- (1 / sqrt(2 * pi))^n * exp(-a2dec_RSStS / 2)
+
+a2dec_AIC_value_tT <- 2 * k - 2 * log(a2dec_LtT)
+a2dec_AIC_value_tE <- 2 * k - 2 * log(a2dec_LtE)
+a2dec_AIC_value_tS <- 2 * k - 2 * log(a2dec_LtS)
+
+# print the Results
+print(a2dec_AIC_value_oT)
+print(a2dec_AIC_value_tT)
+print(a2dec_AIC_value_oE)
+print(a2dec_AIC_value_tE)
+print(a2dec_AIC_value_oS)
+print(a2dec_AIC_value_tS)
+```
+
+
+```{r Adonis2 PerMANOVA}
+# errors not equal to 0
+data_error <- data %>%
+  mutate(Error = Error + 10.00000000001)
+
+# Manova Test
+manova_result <- manova(cbind(TimeSec, Error, SUS) ~ Location * System, data = data_error)
+
+
+# adonis for permutation testing
+perm_test <- adonis2(data_error[, c("TimeSec", "Error", "SUS")] ~ Location * System, data = data_error, permutations = 999)
+
+# Display results
+print(perm_test)
+
+```
+
+
+
